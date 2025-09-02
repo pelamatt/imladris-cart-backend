@@ -267,6 +267,20 @@ app.get('/api/checkout/link', async (req, res) => {
   }
 });
 
+app.post('/api/buy-now', async (req, res) => {
+  try {
+    const { productId, qty = 1, country = 'US', customer_email } = req.body || {};
+    if (!productId) return res.status(400).json({ error: 'missing_product_id' });
+    const out = await createCheckoutFromCart([{ id: productId, qty: Number(qty)||1 }], country, customer_email);
+    if (out.error) return res.status(409).json(out);
+    res.json(out);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'session_failed' });
+  }
+});
+
+
 // Stripe Webhook
 app.post('/api/stripe/webhook', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];

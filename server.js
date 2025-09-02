@@ -3,6 +3,7 @@
 // Exposes:
 //   POST /api/cart/price
 //   POST /api/checkout/create
+//   GET  /api/checkout/link     // NEW (redirects straight to Stripe)
 //   POST /api/stripe/webhook
 //   GET  /api/health
 //
@@ -139,6 +140,64 @@ async function markSold(items, orderId) {
   }
 }
 
+/* -----------------------------
+   SHARED CHECKOUT HELPER (NEW)
+------------------------------*/
+async function createCheckoutFromCart(cart, country = 'US', customer_email) {
+  const ids = cart.map(c => c.id);
+  const products = await fetchProductsByIds(ids);
+  const { items, outOfStock } = validateAndMerge(cart, products);
+  if (outOfStock.length) return { error: 'out_of_stock', outOfStock };
+
+  const holdUntil = await placeHolds(items);
+
+  const line_items = items.map(i => ({
+    price_data: {
+      currency: i.Currency || 'usd',
+      product_data: { name: i.Name, metadata: { airtable_id: i.id, sku: i.SKU } },
+      unit_amount: i.Price,
+    },
+    quantity: i.qty,
+  }));
+
+  const neededTiers = consolidateShippingTiers(items);
+  const shipping_options = [];
+  for (const tier of neededTiers) {
+    const rate = await getShippingRate(tier, country);
+    if (rate) {
+      shipping_options.push({
+        shipping_rate_data: {
+          type: 'fixed_amount',
+          fixed_amount: { amount: rate.amount, currency: items[0]?.Currency || 'usd' },
+          display_name: rate.label,
+          delivery_estimate: {
+            minimum: { unit: 'business_day', value: 3 },
+            maximum: { unit: 'business_day', value: 10 },
+          },
+        },
+      });
+    }
+  }
+
+  const session = await stripe.checkout.sessions.create({
+    mode: 'payment',
+    customer_email,
+    allow_promotion_codes: true,
+    shipping_address_collection: { allowed_countries: ['US', 'CA', 'GB', 'IE', 'FR', 'DE', 'ES', 'IT', 'AU', 'NZ'] },
+    shipping_options,
+    automatic_tax: { enabled: true },
+    line_items,
+    success_url: `${process.env.SITE_URL}/checkout-success?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${process.env.SITE_URL}/cart?canceled=1`,
+    metadata: {
+      airtable_ids: items.map(i => i.id).join(','),
+      hold_until: holdUntil,
+    },
+  });
+
+  return { url: session.url };
+}
+
 // ----- Routes -----
 
 // Price endpoint — returns trusted totals
@@ -170,64 +229,41 @@ app.post('/api/cart/price', async (req, res) => {
   }
 });
 
-// Checkout Session creation
+// Checkout Session creation (reuses helper)
 app.post('/api/checkout/create', async (req, res) => {
   try {
     const { items: cart, customer_email, country = 'US' } = req.body || {};
     if (!Array.isArray(cart) || cart.length === 0) return res.status(400).json({ error: 'empty_cart' });
 
-    const ids = cart.map(c => c.id);
-    const products = await fetchProductsByIds(ids);
-    const { items, outOfStock } = validateAndMerge(cart, products);
-    if (outOfStock.length) return res.status(409).json({ error: 'out_of_stock', outOfStock });
-
-    const holdUntil = await placeHolds(items);
-
-    const line_items = items.map(i => ({
-      price_data: {
-        currency: i.Currency || 'usd',
-        product_data: { name: i.Name, metadata: { airtable_id: i.id, sku: i.SKU } },
-        unit_amount: i.Price,
-      },
-      quantity: i.qty,
-    }));
-
-    const neededTiers = consolidateShippingTiers(items);
-    const shipping_options = [];
-    for (const tier of neededTiers) {
-      const rate = await getShippingRate(tier, country);
-      if (rate) {
-        shipping_options.push({
-          shipping_rate_data: {
-            type: 'fixed_amount',
-            fixed_amount: { amount: rate.amount, currency: items[0]?.Currency || 'usd' },
-            display_name: rate.label,
-            delivery_estimate: { minimum: { unit: 'business_day', value: 3 }, maximum: { unit: 'business_day', value: 10 } },
-          },
-        });
-      }
-    }
-
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      customer_email,
-      allow_promotion_codes: true,
-      shipping_address_collection: { allowed_countries: ['US', 'CA', 'GB', 'IE', 'FR', 'DE', 'ES', 'IT', 'AU', 'NZ'] },
-      shipping_options,
-      automatic_tax: { enabled: true },
-      line_items,
-      success_url: `${process.env.SITE_URL}/checkout-success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.SITE_URL}/cart?canceled=1`,
-      metadata: {
-        airtable_ids: items.map(i => i.id).join(','),
-        hold_until: holdUntil,
-      },
-    });
-
-    return res.json({ url: session.url });
+    const out = await createCheckoutFromCart(cart, country, customer_email);
+    if (out.error) return res.status(409).json(out);
+    return res.json(out);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'session_failed' });
+  }
+});
+
+// NEW: simple link endpoint for Softr "Open URL" buttons
+// Example: GET /api/checkout/link?id=recXXXX&qty=1&country=US&email=jenny%40example.com
+app.get('/api/checkout/link', async (req, res) => {
+  try {
+    const id = req.query.id;
+    const qty = Math.max(1, Number(req.query.qty || 1));
+    const country = (req.query.country || 'US').toUpperCase();
+    const email = req.query.email;
+    if (!id) return res.status(400).send('missing id');
+
+    const out = await createCheckoutFromCart([{ id, qty }], country, email);
+    if (out.error === 'out_of_stock') {
+      return res.redirect(`${process.env.SITE_URL}/sold-out`);
+    }
+    if (!out.url) return res.status(500).send('session_failed');
+
+    return res.redirect(out.url);
+  } catch (e) {
+    console.error(e);
+    res.status(500).send('link_error');
   }
 });
 

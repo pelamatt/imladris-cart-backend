@@ -42,7 +42,7 @@ app.use((req, res, next) => {
 });
 
 // TODO: in production, change origin to your Softr domain only, e.g. 'https://imladrisarchives.com'
-app.use(cors({ origin: true }));
+app.use(cors({ origin: ['https://www.imladrisarchives.com', 'https://imladrisarchives.softr.app'] }));
 
 // Airtable setup
 const base = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(process.env.AIRTABLE_BASE_ID);

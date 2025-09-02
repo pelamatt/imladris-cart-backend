@@ -30,7 +30,7 @@ import Airtable from 'airtable';
 const app = express();
 const port = process.env.PORT || 8787;
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2025-07-30.basil' });
 
 // Use JSON for normal routes; raw body for webhook verification
 app.use((req, res, next) => {
